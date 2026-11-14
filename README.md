@@ -9,7 +9,7 @@ Exact MQL5 port of `V12_STRAT.pine` (Dickey-Fuller climax breakout/retest + reve
 | File | Purpose |
 | --- | --- |
 | [`V12_Indicators.mqh`](V12_Indicators.mqh) | Pure Pine-equivalent indicator math (`ATR` via Wilder's RMA with SMA seed, `EMA` with SMA seed, `Highest`/`Lowest`, non-drifting rolling Dickey-Fuller `t_stat`, strictly-greater percentile rank `t_pct`, `df_hook`), shared 9-step closed-bar state machine `V12_StepBar`, and intrabar exit simulator `V12_SimulateIntrabarExit`. |
-| [`V12_EA.mq5`](V12_EA.mq5) | Live/Strategy Tester Expert Advisor: replays `V12_REPLAY_BARS = 3200` closed H1 bars in `OnInit`, reconciles active broker positions (`L`, `S`, `RL`, `RS` via `magic`), executes strictly once per closed H1 bar with session-open/market-closed retry handling, enforces `max_loss_usd` and the persistent `halt_dd_R` kill switch, sends Telegram `WebRequest` alerts, and exports deals to `Common\Files\V12_Tester_Trades.csv` in Strategy Tester `OnDeinit`. |
+| [`V12_EA.mq5`](V12_EA.mq5) | Live/Strategy Tester Expert Advisor: replays `V12_REPLAY_BARS = 3200` closed H1 bars in `OnInit`, reconciles active broker positions (`L`, `S`, `RL`, `RS` via `magic`), executes strictly once per closed H1 bar with session-open/market-closed retry handling, rebuilds state from history when disconnected across missed H1 bars (`iBarShift > 1`) with Telegram alerts, enforces `max_loss_usd` and the persistent `halt_dd_R` kill switch, sends Telegram `WebRequest` alerts, and exports deals to `Common\Files\V12_Tester_Trades.csv` in Strategy Tester `OnDeinit`. |
 | [`V12_Debug.mq5`](V12_Debug.mq5) | Self-contained indicator unit tests + CSV bar-by-bar exporter (`time,open,high,low,close,atr,ema,range_hi,range_lo,t_stat,t_pct,df_hook,lvl_up,lvl_dn,signal`), supporting both live chart H1 history (`inp_use_csv_input=false`) and deterministic CSV OHLC input (`inp_use_csv_input=true`). |
 | [`V12_STRAT.pine`](V12_STRAT.pine) | Pine Script v5 strategy source of truth. |
 | [`V12_EA_cline_brief.md`](V12_EA_cline_brief.md) | Port specification and acceptance criteria. |
@@ -63,13 +63,13 @@ Per `V12_EA_cline_brief.md`, the following Pine options are intentionally omitte
 
 | Group | Input Name | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| EA Money Management & Execution | `lot_mode` | `ENUM_LOT_MODE` | `LOT_RISK_USD` | `LOT_FIXED` (0) or `LOT_RISK_USD` (1) |
+| EA Money Management & Execution | `lot_mode` | `ENUM_LOT_MODE` | `LOT_FIXED` | `LOT_FIXED` (0) or `LOT_RISK_USD` (1) |
 | EA Money Management & Execution | `fixed_lot` | `double` | `0.01` | Lot size used when `lot_mode = LOT_FIXED` |
 | EA Money Management & Execution | `risk_usd` | `double` | `30.0` | Target stop-loss risk per trade in USD (rounded down to broker lot step) |
 | EA Money Management & Execution | `max_loss_usd` | `double` | `100.0` | Hard loss cap per trade in USD; skips entry if minimum lot (`SYMBOL_VOLUME_MIN`) exceeds cap |
 | EA Money Management & Execution | `magic` | `ulong` | `1212` | EA magic number used to isolate positions and deals |
 | EA Money Management & Execution | `slippage_points` | `int` | `50` | Maximum allowed order deviation in points |
-| EA Money Management & Execution | `halt_dd_R` | `double` | `15.0` | Kill switch: halts new entries if peak-to-trough realized `R` drawdown `>= halt_dd_R` (`<= 0` disables) |
+| EA Money Management & Execution | `halt_dd_R` | `double` | `20.0` | Kill switch: halts new entries if peak-to-trough realized `R` drawdown `>= halt_dd_R` (`<= 0` disables) |
 | Telegram Notifications | `tg_enable` | `bool` | `false` | Enable Telegram Bot API notifications (disabled automatically in Strategy Tester) |
 | Telegram Notifications | `tg_token` | `string` | `""` | Telegram Bot token (enter only in MT5 chart inputs/local `.set`; never commit tokens to git) |
 | Telegram Notifications | `tg_chat_id` | `string` | `""` | Target Telegram chat or channel ID |
@@ -90,6 +90,7 @@ When `g_peak_R - g_cum_R >= halt_dd_R`, `g_halted` flips to `true` and is persis
 4. **Daily/Weekend Market-Open Handling**: Exness `XAUUSDm` frequently delivers quote ticks during daily/Sunday market-break transitions slightly before trading opens (`TRADE_RETCODE_MARKET_CLOSED` / `retcode 10018`). `V12_EA` evaluates `V12_StepBar` strictly once per newly closed H1 bar, queues pending open/close/SL-modify actions across ticks of that same H1 bar, checks `IsTradeSessionOpen()`, and retries once trading opens (expiring unexecuted entries if a subsequent H1 bar closes first).
 5. **VPS Restart Reconciliation**: On `OnInit`, after replaying `3,200` closed bars, any live open broker position matching `magic` and `_Symbol` overrides simulated position state (`pos_dir`, `eid` from `"L"`/`"S"`/`"RL"`/`"RS"` comment or TP presence, `stop_px`/`r_stop`/`r_tgt`, and `rev_bar` derived from `POSITION_TIME`).
    - Note: `V12_Indicators.mqh` / `V12_EA.mq5` assumes a single active position per `magic` + symbol at any time (`no pyramiding`, matching `V12_STRAT.pine`). Do not run two instances on the same account/symbol with the same `magic`.
+6. **Missed-Bar Disconnect Recovery**: In `OnTick`, when a new H1 bar opens (`cur_bar_time != g_last_bar_time`), if `iBarShift(_Symbol, PERIOD_H1, g_last_bar_time) > 1` (bars were missed while disconnected), `V12_EA` calls `RebuildStateFromHistory()` across the recent bar history and sends a Telegram `"state rebuilt after N missed bars"` alert instead of stepping only bar `0`. Because `iBarShift` counts H1 bars rather than wall-clock hours, weekend gaps and daily market breaks return `1` and continue normal bar stepping without false rebuilds.
 
 ### Telegram Alerts (`WebRequest`)
 1. Create a bot with `@BotFather` and obtain your Bot Token and Chat ID.
@@ -118,8 +119,9 @@ Running `V12_Debug` executes built-in unit tests (`V12_Debug: ALL indicator unit
   - `signal` mismatches: **`0 / 10,668`**
 
 ### B. Strategy Tester vs `V12_Debug` (Same Exness `XAUUSDm` Feed)
-Ran MT5 Strategy Tester (`XAUUSDm`, `H1`, `Model=4` "Every tick based on real ticks", `2025.01.01`–`2026.11.11`, `$10,000` deposit, `1:500` leverage):
-- **Execution log**: `158,663,653 ticks`, `11,003` bars, **0 `OrderSend failed` errors**, final balance **$12,887.50 USD**, `477` deals (`239` entries), `CumR=88.97`, `Halted=NO`, exported to `Common\Files\V12_Tester_Trades.csv`.
+Ran MT5 Strategy Tester (`XAUUSDm`, `H1`, `Model=4` "Every tick based on real ticks", `2025.01.01`–`2026.11.11`, `$10,000` deposit, `1:500` leverage) with updated defaults (`lot_mode = LOT_FIXED`, `fixed_lot = 0.01`, `halt_dd_R = 20.0`):
+- **Performance & Drawdown**: final balance **$12,550.23 USD** (`Total Net Profit: $2,550.23`, `Gross Profit: $5,202.95`, `Gross Loss: -$2,652.72`, `Profit Factor: 1.96`, `Recovery Factor: 7.94`), `Balance Drawdown Maximal: $281.36 (2.76%)`, `Equity Drawdown Maximal: $321.00 (3.14%)`, realized **`MaxDD_R = 8.06 R`**, **`CumR = 88.97 R`**, `Halted = NO`.
+- **Trades & Execution**: `239` Total Trades (`478` report deals including end-of-test open position close; `477` closed-bar deals exported to `Common\Files\V12_Tester_Trades.csv`), **0** missed-bar rebuild triggers across weekends and daily market breaks.
 - **Parity on identical feed**: **`239 / 239 (100.0%)`** Strategy Tester entries match `V12_Debug` exact bar open timestamp, direction (`BUY`/`SELL`), and entry ID (`L`/`S`/`RL`/`RS`).
 - **7 `V12_Debug` signals not executed in Strategy Tester**:
   - `4` (`2026.01.30 20:00`, `2026.02.04 02:00`, `2026.02.06 00:00`, `2026.03.03 13:00`): Intentionally skipped by `max_loss_usd = $100.00` during `$4,700–$5,500` gold volatility where minimum lot (`0.01`) stop risk was `$101.70–$216.01`.

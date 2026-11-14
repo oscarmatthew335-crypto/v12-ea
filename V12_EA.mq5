@@ -41,13 +41,13 @@ input double        rev_rr     = 1.5;    // Reversal Fixed R fallback target
 input int           rev_max    = 24;     // Close a reversal after (bars) if still open
 
 input group "EA Money Management & Execution"
-input ENUM_LOT_MODE lot_mode        = LOT_RISK_USD; // Position sizing mode
+input ENUM_LOT_MODE lot_mode        = LOT_FIXED;    // Position sizing mode
 input double        fixed_lot       = 0.01;         // Fixed lot size
 input double        risk_usd        = 30.0;         // Risk per trade (USD)
 input double        max_loss_usd    = 100.0;        // Hard max loss cap per trade (USD)
 input ulong         magic           = 1212;         // EA Magic Number
 input int           slippage_points = 50;           // Max slippage (points)
-input double        halt_dd_R       = 15.0;         // Kill switch max R drawdown from peak
+input double        halt_dd_R       = 20.0;         // Kill switch max R drawdown from peak
 
 input group "Telegram Notifications"
 input bool          tg_enable  = false;  // Enable Telegram alerts
@@ -69,6 +69,7 @@ double         g_active_init_risk   = 0.0;
 
 double         g_cum_R              = 0.0;
 double         g_peak_R             = 0.0;
+double         g_max_dd_R           = 0.0;
 bool           g_halted             = false;
 
 uint           g_last_retcode       = 0;
@@ -530,6 +531,8 @@ void RecordClosedPosition(long pos_id, const string exit_reason, double known_in
    if(g_cum_R > g_peak_R)
       g_peak_R = g_cum_R;
    double dd_R = g_peak_R - g_cum_R;
+   if(dd_R > g_max_dd_R)
+      g_max_dd_R = dd_R;
 
    if(ShouldPersistGlobals())
       GlobalVariableSet(GVKey("LAST_CLOSED_ID"), (double)pos_id);
@@ -739,7 +742,7 @@ bool RebuildStateFromHistory()
       V12_StepBar(b, g_bar_t, high, low, close, sd, g_params, false, g_state, act);
    }
 
-   g_last_bar_time      = rates[0].time;
+   g_last_bar_time      = iTime(_Symbol, PERIOD_H1, 0);
    g_sltp_synced_bar    = g_last_bar_time;
    g_pend_bar_time      = 0;
    g_pend_close_hook    = false;
@@ -846,6 +849,7 @@ int OnInit()
 
    LoadParams(g_params);
    ConfigureTradeObject();
+   g_max_dd_R = 0.0;
 
    // Restore Kill Switch state and check if halt_dd_R input was reset
    if(ShouldPersistGlobals() && GlobalVariableCheck(GVKey("CUM_R")))
@@ -896,8 +900,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   datetime cur_closed_time = iTime(_Symbol, PERIOD_H1, 1);
-   if(cur_closed_time == 0)
+   datetime cur_bar_time = iTime(_Symbol, PERIOD_H1, 0);
+   if(cur_bar_time == 0)
       return;
 
    ulong cur_ticket = 0; long cur_pos_id = 0; ENUM_POSITION_TYPE cur_type = POSITION_TYPE_BUY;
@@ -906,7 +910,7 @@ void OnTick()
    bool has_pos = false;
 
    // Evaluate closed H1 bar once when bar closes
-   if(cur_closed_time != g_last_bar_time)
+   if(cur_bar_time != g_last_bar_time)
    {
       has_pos = FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
                                  cur_open_px, cur_open_time, cur_vol, cur_comment);
@@ -931,51 +935,66 @@ void OnTick()
          g_state.eid     = ParseEntryId(cur_comment, cur_type, cur_tp);
       }
 
-      int need_bars = V12_REPLAY_BARS + V12_MinWarmupBars(g_params) + 50;
-      int avail     = iBars(_Symbol, PERIOD_H1) - 1;
-      int copy_cnt  = MathMin(need_bars, avail);
-
-      MqlRates rates[];
-      double open[], high[], low[], close[];
-      if(!CopyClosedH1Bars(copy_cnt, rates, open, high, low, close))
-         return; // wait for next tick if history isn't ready
-
-      V12_SeriesData sd;
-      if(!V12_ComputeAllSeries(high, low, close, copy_cnt, g_params, sd))
-         return;
-
-      g_last_bar_time = cur_closed_time;
-      g_bar_t++;
-
-      V12_BarActions act;
-      V12_StepBar(0, g_bar_t, high, low, close, sd, g_params, true, g_state, act);
-
-      // Telegram skip notifications
-      if(act.skip_long || act.skip_short)
+      int bar_shift = (g_last_bar_time > 0) ? iBarShift(_Symbol, PERIOD_H1, g_last_bar_time) : 1;
+      if(bar_shift > 1)
       {
-         string skip_msg = StringFormat("[V12 %s] SKIP %s (DF hook cooldown active) @ %.2f",
-                                        _Symbol, (act.skip_long ? "Trend L" : "Trend S"), close[0]);
-         Print("V12_EA: ", skip_msg);
-         SendTelegram(skip_msg);
+         int missed_bars = bar_shift - 1;
+         if(!RebuildStateFromHistory())
+            return;
+
+         g_sltp_synced_bar = 0;
+         string reb_msg = StringFormat("[V12 %s] state rebuilt after %d missed bars", _Symbol, missed_bars);
+         Print("V12_EA: ", reb_msg);
+         SendTelegram(reb_msg);
       }
+      else
+      {
+         int need_bars = V12_REPLAY_BARS + V12_MinWarmupBars(g_params) + 50;
+         int avail     = iBars(_Symbol, PERIOD_H1) - 1;
+         int copy_cnt  = MathMin(need_bars, avail);
 
-      g_pend_bar_time = cur_closed_time;
-      if(act.close_trend_hook)
-         g_pend_close_hook = true;
-      if(act.close_rev_time)
-         g_pend_close_rev_time = true;
+         MqlRates rates[];
+         double open[], high[], low[], close[];
+         if(!CopyClosedH1Bars(copy_cnt, rates, open, high, low, close))
+            return; // wait for next tick if history isn't ready
 
-      g_pend_open_rev_dir = act.open_rev_dir;
-      if(act.open_rev_dir != 0)
-         g_pend_close_hook = false;
+         V12_SeriesData sd;
+         if(!V12_ComputeAllSeries(high, low, close, copy_cnt, g_params, sd))
+            return;
 
-      g_pend_go_long  = act.go_long;
-      g_pend_go_short = act.go_short;
+         g_last_bar_time = cur_bar_time;
+         g_bar_t++;
+
+         V12_BarActions act;
+         V12_StepBar(0, g_bar_t, high, low, close, sd, g_params, true, g_state, act);
+
+         // Telegram skip notifications
+         if(act.skip_long || act.skip_short)
+         {
+            string skip_msg = StringFormat("[V12 %s] SKIP %s (DF hook cooldown active) @ %.2f",
+                                           _Symbol, (act.skip_long ? "Trend L" : "Trend S"), close[0]);
+            Print("V12_EA: ", skip_msg);
+            SendTelegram(skip_msg);
+         }
+
+         g_pend_bar_time = cur_bar_time;
+         if(act.close_trend_hook)
+            g_pend_close_hook = true;
+         if(act.close_rev_time)
+            g_pend_close_rev_time = true;
+
+         g_pend_open_rev_dir = act.open_rev_dir;
+         if(act.open_rev_dir != 0)
+            g_pend_close_hook = false;
+
+         g_pend_go_long  = act.go_long;
+         g_pend_go_short = act.go_short;
+      }
    }
 
    bool has_pending = g_pend_close_hook || g_pend_close_rev_time ||
                       (g_pend_open_rev_dir != 0) || g_pend_go_long || g_pend_go_short ||
-                      (g_sltp_synced_bar != cur_closed_time);
+                      (g_sltp_synced_bar != cur_bar_time);
    if(!has_pending)
       return;
 
@@ -1020,7 +1039,7 @@ void OnTick()
 
    if(g_pend_open_rev_dir != 0)
    {
-      if(cur_closed_time != g_pend_bar_time)
+      if(cur_bar_time != g_pend_bar_time)
       {
          g_pend_open_rev_dir = 0;
       }
@@ -1048,7 +1067,7 @@ void OnTick()
             {
                opened_this_bar     = true;
                g_pend_open_rev_dir = 0;
-               g_sltp_synced_bar   = cur_closed_time;
+               g_sltp_synced_bar   = cur_bar_time;
             }
             else if(IsMarketClosedError())
             {
@@ -1065,7 +1084,7 @@ void OnTick()
 
    if(g_pend_go_long || g_pend_go_short)
    {
-      if(cur_closed_time != g_pend_bar_time)
+      if(cur_bar_time != g_pend_bar_time)
       {
          g_pend_go_long  = false;
          g_pend_go_short = false;
@@ -1080,7 +1099,7 @@ void OnTick()
             opened_this_bar   = true;
             g_pend_go_long    = false;
             g_pend_go_short   = false;
-            g_sltp_synced_bar = cur_closed_time;
+            g_sltp_synced_bar = cur_bar_time;
          }
          else if(IsMarketClosedError())
          {
@@ -1114,7 +1133,7 @@ void OnTick()
    }
 
    // Manage SL / TP on any remaining open position (once per closed bar)
-   if(g_sltp_synced_bar != cur_closed_time)
+   if(g_sltp_synced_bar != cur_bar_time)
    {
       bool sltp_need_retry = false;
       if(!opened_this_bar && FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
@@ -1202,7 +1221,7 @@ void OnTick()
          g_retry_after_time = TimeCurrent() + 60;
          return;
       }
-      g_sltp_synced_bar = cur_closed_time;
+      g_sltp_synced_bar = cur_bar_time;
    }
 }
 
@@ -1268,7 +1287,7 @@ void OnDeinit(const int reason)
    }
 
    FileClose(fh);
-   PrintFormat("V12_EA: Exported %d tester deals to Common\\Files\\V12_Tester_Trades.csv (CumR=%.2f, Halted=%s)",
-               exported, g_cum_R, (g_halted ? "YES" : "NO"));
+   PrintFormat("V12_EA: Exported %d tester deals to Common\\Files\\V12_Tester_Trades.csv (CumR=%.2f, MaxDD_R=%.2f, Halted=%s)",
+               exported, g_cum_R, g_max_dd_R, (g_halted ? "YES" : "NO"));
 }
 //+------------------------------------------------------------------+
