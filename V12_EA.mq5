@@ -1003,4 +1003,70 @@ void OnTick()
       }
    }
 }
+
+//+------------------------------------------------------------------+
+//| Strategy Tester deinit: export trade deal list to Common\\Files  |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(!MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION))
+      return;
+
+   if(!HistorySelect(0, TimeCurrent()))
+      return;
+
+   int fh = FileOpen("V12_Tester_Trades.csv", FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(fh == INVALID_HANDLE)
+   {
+      PrintFormat("V12_EA: Failed to open V12_Tester_Trades.csv (err=%d)", GetLastError());
+      return;
+   }
+
+   FileWriteString(fh, "deal_ticket,pos_id,time,entry,type,volume,price,sl,tp,profit,commission,swap,reason,comment\r\n");
+
+   int total = HistoryDealsTotal();
+   int exported = 0;
+   for(int i = 0; i < total; i++)
+   {
+      ulong d_ticket = HistoryDealGetTicket(i);
+      if(d_ticket == 0)
+         continue;
+      if((ulong)HistoryDealGetInteger(d_ticket, DEAL_MAGIC) != magic)
+         continue;
+
+      long   pos_id     = HistoryDealGetInteger(d_ticket, DEAL_POSITION_ID);
+      datetime d_time   = (datetime)HistoryDealGetInteger(d_ticket, DEAL_TIME);
+      long   d_entry    = HistoryDealGetInteger(d_ticket, DEAL_ENTRY);
+      long   d_type     = HistoryDealGetInteger(d_ticket, DEAL_TYPE);
+      double vol        = HistoryDealGetDouble(d_ticket, DEAL_VOLUME);
+      double px         = HistoryDealGetDouble(d_ticket, DEAL_PRICE);
+      double sl         = HistoryDealGetDouble(d_ticket, DEAL_SL);
+      double tp         = HistoryDealGetDouble(d_ticket, DEAL_TP);
+      double profit     = HistoryDealGetDouble(d_ticket, DEAL_PROFIT);
+      double comm       = HistoryDealGetDouble(d_ticket, DEAL_COMMISSION);
+      double swap       = HistoryDealGetDouble(d_ticket, DEAL_SWAP);
+      long   d_reason   = HistoryDealGetInteger(d_ticket, DEAL_REASON);
+      string comment    = HistoryDealGetString(d_ticket, DEAL_COMMENT);
+      StringReplace(comment, ",", ";");
+
+      string entry_s = (d_entry == DEAL_ENTRY_IN) ? "IN"
+                       : ((d_entry == DEAL_ENTRY_OUT) ? "OUT"
+                       : ((d_entry == DEAL_ENTRY_OUT_BY) ? "OUT_BY" : "INOUT"));
+      string type_s  = (d_type == DEAL_TYPE_BUY) ? "BUY"
+                       : ((d_type == DEAL_TYPE_SELL) ? "SELL" : IntegerToString((int)d_type));
+      string reason_s = (d_reason == DEAL_REASON_EXPERT) ? "EXPERT"
+                        : ((d_reason == DEAL_REASON_SL) ? "SL"
+                        : ((d_reason == DEAL_REASON_TP) ? "TP" : IntegerToString((int)d_reason)));
+
+      string row = StringFormat("%I64u,%I64d,%s,%s,%s,%.2f,%.5f,%.5f,%.5f,%.2f,%.2f,%.2f,%s,%s\r\n",
+                                d_ticket, pos_id, TimeToString(d_time, TIME_DATE | TIME_SECONDS),
+                                entry_s, type_s, vol, px, sl, tp, profit, comm, swap, reason_s, comment);
+      FileWriteString(fh, row);
+      exported++;
+   }
+
+   FileClose(fh);
+   PrintFormat("V12_EA: Exported %d tester deals to Common\\Files\\V12_Tester_Trades.csv (CumR=%.2f, Halted=%s)",
+               exported, g_cum_R, (g_halted ? "YES" : "NO"));
+}
 //+------------------------------------------------------------------+
