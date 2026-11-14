@@ -259,9 +259,9 @@ double V12_TrueRange(const double &high[], const double &low[], const double &cl
 //| Wilder's RMA of True Range (matches Pine ta.atr, NOT MT5 iATR)   |
 //+------------------------------------------------------------------+
 bool V12_CalcATRSeries(const double &high[], const double &low[], const double &close[],
-                       int count, int atr_len, double &atr_out[])
+                       int count, int len, double &atr_out[])
 {
-   if(count <= 0 || atr_len <= 0 || count < atr_len)
+   if(count <= 0 || len <= 0 || count < len)
       return false;
    if(ArraySize(high) < count || ArraySize(low) < count || ArraySize(close) < count)
       return false;
@@ -270,17 +270,17 @@ bool V12_CalcATRSeries(const double &high[], const double &low[], const double &
    ArraySetAsSeries(atr_out, true);
    ArrayInitialize(atr_out, EMPTY_VALUE);
 
-   // Seed with SMA of the first atr_len TR values (oldest bars: count-1 down to count-atr_len)
+   // Seed with SMA of the first len TR values (oldest bars: count-1 down to count-len)
    double tr_sum = 0.0;
-   for(int k = 0; k < atr_len; k++)
+   for(int k = 0; k < len; k++)
    {
       int idx = count - 1 - k;
       tr_sum += V12_TrueRange(high, low, close, idx, count);
    }
-   int seed_idx = count - atr_len;
-   atr_out[seed_idx] = tr_sum / (double)atr_len;
+   int seed_idx = count - len;
+   atr_out[seed_idx] = tr_sum / (double)len;
 
-   double alpha = 1.0 / (double)atr_len;
+   double alpha = 1.0 / (double)len;
    for(int idx = seed_idx - 1; idx >= 0; idx--)
    {
       double tr = V12_TrueRange(high, low, close, idx, count);
@@ -293,10 +293,10 @@ bool V12_CalcATRSeries(const double &high[], const double &low[], const double &
 //| Single-value ATR at series index target_idx                      |
 //+------------------------------------------------------------------+
 double V12_CalcATR(const double &high[], const double &low[], const double &close[],
-                   int count, int atr_len, int target_idx = 0)
+                   int count, int len, int target_idx = 0)
 {
    double atr_buf[];
-   if(!V12_CalcATRSeries(high, low, close, count, atr_len, atr_buf))
+   if(!V12_CalcATRSeries(high, low, close, count, len, atr_buf))
       return EMPTY_VALUE;
    if(target_idx < 0 || target_idx >= count)
       return EMPTY_VALUE;
@@ -304,11 +304,11 @@ double V12_CalcATR(const double &high[], const double &low[], const double &clos
 }
 
 //+------------------------------------------------------------------+
-//| Exponential Moving Average seeded with first ema_len SMA         |
+//| Exponential Moving Average seeded with first len SMA             |
 //+------------------------------------------------------------------+
-bool V12_CalcEMASeries(const double &close[], int count, int ema_len, double &ema_out[])
+bool V12_CalcEMASeries(const double &close[], int count, int len, double &ema_out[])
 {
-   if(count <= 0 || ema_len <= 0 || count < ema_len || ArraySize(close) < count)
+   if(count <= 0 || len <= 0 || count < len || ArraySize(close) < count)
       return false;
 
    ArrayResize(ema_out, count);
@@ -316,13 +316,13 @@ bool V12_CalcEMASeries(const double &close[], int count, int ema_len, double &em
    ArrayInitialize(ema_out, EMPTY_VALUE);
 
    double sum = 0.0;
-   for(int k = 0; k < ema_len; k++)
+   for(int k = 0; k < len; k++)
       sum += close[count - 1 - k];
 
-   int seed_idx = count - ema_len;
-   ema_out[seed_idx] = sum / (double)ema_len;
+   int seed_idx = count - len;
+   ema_out[seed_idx] = sum / (double)len;
 
-   double alpha = 2.0 / ((double)ema_len + 1.0);
+   double alpha = 2.0 / ((double)len + 1.0);
    for(int idx = seed_idx - 1; idx >= 0; idx--)
       ema_out[idx] = alpha * close[idx] + (1.0 - alpha) * ema_out[idx + 1];
 
@@ -332,10 +332,10 @@ bool V12_CalcEMASeries(const double &close[], int count, int ema_len, double &em
 //+------------------------------------------------------------------+
 //| Single-value EMA at series index target_idx                      |
 //+------------------------------------------------------------------+
-double V12_CalcEMA(const double &close[], int count, int ema_len, int target_idx = 0)
+double V12_CalcEMA(const double &close[], int count, int len, int target_idx = 0)
 {
    double ema_buf[];
-   if(!V12_CalcEMASeries(close, count, ema_len, ema_buf))
+   if(!V12_CalcEMASeries(close, count, len, ema_buf))
       return EMPTY_VALUE;
    if(target_idx < 0 || target_idx >= count)
       return EMPTY_VALUE;
@@ -343,12 +343,12 @@ double V12_CalcEMA(const double &close[], int count, int ema_len, int target_idx
 }
 
 //+------------------------------------------------------------------+
-//| Strictly-greater percentile rank over t_stat[b .. b + norm_len-1]|
+//| Strictly-greater percentile rank over t_stat[b .. b + len - 1]   |
 //+------------------------------------------------------------------+
-double V12_CalcPctRank(const double &t_stat[], int b, int norm_len)
+double V12_CalcPctRank(const double &t_stat[], int b, int len)
 {
    int size = ArraySize(t_stat);
-   if(norm_len <= 0 || b < 0 || b + norm_len > size)
+   if(len <= 0 || b < 0 || b + len > size)
       return EMPTY_VALUE;
 
    double val = t_stat[b];
@@ -356,21 +356,21 @@ double V12_CalcPctRank(const double &t_stat[], int b, int norm_len)
       return EMPTY_VALUE;
 
    int count_below = 0;
-   for(int i = 0; i < norm_len; i++)
+   for(int i = 0; i < len; i++)
    {
       double cmp = t_stat[b + i];
       if(cmp != EMPTY_VALUE && MathIsValidNumber(cmp) && val > cmp)
          count_below++;
    }
-   return ((double)count_below / (double)norm_len) * 100.0;
+   return ((double)count_below / (double)len) * 100.0;
 }
 
 //+------------------------------------------------------------------+
 //| DF Gauge t-stat series (exact Pine formula, double precision)    |
 //+------------------------------------------------------------------+
-bool V12_CalcDFSeries(const double &close[], int count, int df_len, double &t_stat_out[])
+bool V12_CalcDFSeries(const double &close[], int count, int len, double &t_stat_out[])
 {
-   if(count <= 0 || df_len <= 1 || count <= 2 * df_len || ArraySize(close) < count)
+   if(count <= 0 || len <= 1 || count <= 2 * len || ArraySize(close) < count)
       return false;
 
    ArrayResize(t_stat_out, count);
@@ -410,11 +410,11 @@ bool V12_CalcDFSeries(const double &close[], int count, int df_len, double &t_st
    }
 
    // Direct window sums per bar (no sliding-sum drift) and per-bar residual storage
-   int first_reg_idx = count - df_len;
+   int first_reg_idx = count - len;
    for(int idx = first_reg_idx; idx >= 0; idx--)
    {
       double s_dy = 0.0, s_yl = 0.0, s_dy_yl = 0.0, s_yl_sq = 0.0;
-      for(int k = 0; k < df_len; k++)
+      for(int k = 0; k < len; k++)
       {
          int j = idx + k;
          s_dy    += dy[j];
@@ -423,10 +423,10 @@ bool V12_CalcDFSeries(const double &close[], int count, int df_len, double &t_st
          s_yl_sq += ylag_sq[j];
       }
 
-      double mean_dy   = s_dy    / (double)df_len;
-      double mean_ylag = s_yl    / (double)df_len;
-      double covar     = (s_dy_yl / (double)df_len) - (mean_dy * mean_ylag);
-      double var_y     = (s_yl_sq / (double)df_len) - (mean_ylag * mean_ylag);
+      double mean_dy   = s_dy    / (double)len;
+      double mean_ylag = s_yl    / (double)len;
+      double covar     = (s_dy_yl / (double)len) - (mean_dy * mean_ylag);
+      double var_y     = (s_yl_sq / (double)len) - (mean_ylag * mean_ylag);
       double beta      = (var_y == 0.0) ? 0.0 : (covar / var_y);
       double alpha     = mean_dy - (beta * mean_ylag);
       double res       = dy[idx] - (alpha + (beta * y_lag[idx]));
@@ -436,18 +436,18 @@ bool V12_CalcDFSeries(const double &close[], int count, int df_len, double &t_st
       beta_arr[idx]  = beta;
    }
 
-   int first_t_idx = first_reg_idx - (df_len - 1);
+   int first_t_idx = first_reg_idx - (len - 1);
    if(first_t_idx < 0)
       return false;
 
    for(int idx = first_t_idx; idx >= 0; idx--)
    {
       double s_res_sq = 0.0;
-      for(int k = 0; k < df_len; k++)
+      for(int k = 0; k < len; k++)
          s_res_sq += res_sq[idx + k];
 
-      double mse     = MathMax(0.0, s_res_sq / (double)df_len);
-      double denom_v = (double)df_len * var_y_arr[idx];
+      double mse     = MathMax(0.0, s_res_sq / (double)len);
+      double denom_v = (double)len * var_y_arr[idx];
       double se_beta = (denom_v <= 0.0) ? 0.0001 : MathSqrt(mse / denom_v);
       t_stat_out[idx] = (se_beta == 0.0) ? 0.0 : (beta_arr[idx] / se_beta);
    }
@@ -458,10 +458,10 @@ bool V12_CalcDFSeries(const double &close[], int count, int df_len, double &t_st
 //+------------------------------------------------------------------+
 //| Pure single-bar DF calculation at bar target_idx                 |
 //+------------------------------------------------------------------+
-double V12_CalcDFBar(const double &close[], int count, int df_len, int target_idx = 0)
+double V12_CalcDFBar(const double &close[], int count, int len, int target_idx = 0)
 {
    double t_buf[];
-   if(!V12_CalcDFSeries(close, count, df_len, t_buf))
+   if(!V12_CalcDFSeries(close, count, len, t_buf))
       return EMPTY_VALUE;
    if(target_idx < 0 || target_idx >= count)
       return EMPTY_VALUE;

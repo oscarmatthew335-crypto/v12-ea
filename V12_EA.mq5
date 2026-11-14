@@ -6,7 +6,6 @@
 #property version   "1.00"
 #property strict
 
-#include <Trade\Trade.mqh>
 #include "V12_Indicators.mqh"
 
 //+------------------------------------------------------------------+
@@ -58,7 +57,7 @@ input string        tg_chat_id = "";     // Telegram Chat ID
 //+------------------------------------------------------------------+
 //| Global State                                                     |
 //+------------------------------------------------------------------+
-CTrade         g_trade;
+ENUM_ORDER_TYPE_FILLING g_filling_mode = ORDER_FILLING_IOC;
 V12_Params     g_params;
 V12_State      g_state;
 datetime       g_last_bar_time      = 0;
@@ -175,21 +174,93 @@ void LoadParams(V12_Params &p)
 }
 
 //+------------------------------------------------------------------+
-//| Configure CTrade filling mode for Exness / symbol compatibility  |
+//| Detect symbol filling mode & direct OrderSend wrappers           |
 //+------------------------------------------------------------------+
 void ConfigureTradeObject()
 {
-   g_trade.SetExpertMagicNumber(magic);
-   g_trade.SetDeviationInPoints((ulong)MathMax(0, slippage_points));
-   g_trade.SetAsyncMode(false);
-
    long filling = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    if((filling & SYMBOL_FILLING_IOC) != 0)
-      g_trade.SetTypeFilling(ORDER_FILLING_IOC);
+      g_filling_mode = ORDER_FILLING_IOC;
    else if((filling & SYMBOL_FILLING_FOK) != 0)
-      g_trade.SetTypeFilling(ORDER_FILLING_FOK);
+      g_filling_mode = ORDER_FILLING_FOK;
    else
-      g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+      g_filling_mode = ORDER_FILLING_RETURN;
+}
+
+bool SendOrderChecked(const MqlTradeRequest &req, MqlTradeResult &res, const string action_name)
+{
+   ZeroMemory(res);
+   if(!OrderSend(req, res))
+   {
+      PrintFormat("V12_EA: %s OrderSend failed err=%d retcode=%u (%s)",
+                  action_name, GetLastError(), res.retcode, res.comment);
+      return false;
+   }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
+   {
+      PrintFormat("V12_EA: %s rejected retcode=%u (%s)", action_name, res.retcode, res.comment);
+      return false;
+   }
+   return true;
+}
+
+bool V12_SendMarketOrder(ENUM_ORDER_TYPE order_type, double volume, double price,
+                         double sl, double tp, const string comment, double &out_price)
+{
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = _Symbol;
+   req.volume       = volume;
+   req.type         = order_type;
+   req.price        = price;
+   req.sl           = sl;
+   req.tp           = tp;
+   req.deviation    = (ulong)MathMax(0, slippage_points);
+   req.magic        = magic;
+   req.comment      = comment;
+   req.type_filling = g_filling_mode;
+
+   if(!SendOrderChecked(req, res, "Open " + comment))
+      return false;
+   out_price = (res.price > 0.0) ? res.price : price;
+   return true;
+}
+
+bool V12_ClosePositionByTicket(ulong ticket, ENUM_POSITION_TYPE pos_type, double vol)
+{
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   req.action       = TRADE_ACTION_DEAL;
+   req.position     = ticket;
+   req.symbol       = _Symbol;
+   req.volume       = vol;
+   req.type         = (pos_type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   req.price        = (pos_type == POSITION_TYPE_BUY)
+                      ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                      : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   req.deviation    = (ulong)MathMax(0, slippage_points);
+   req.magic        = magic;
+   req.type_filling = g_filling_mode;
+
+   return SendOrderChecked(req, res, "Close");
+}
+
+bool V12_ModifyPositionSLTP(ulong ticket, double sl, double tp)
+{
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   req.action   = TRADE_ACTION_SLTP;
+   req.position = ticket;
+   req.symbol   = _Symbol;
+   req.sl       = sl;
+   req.tp       = tp;
+   req.magic    = magic;
+
+   return SendOrderChecked(req, res, "Modify SL/TP");
 }
 
 //+------------------------------------------------------------------+
@@ -451,12 +522,8 @@ bool CloseActivePosition(const string reason)
    if(risk_for_trade <= 0.0 && sl > 0.0)
       risk_for_trade = MathAbs(open_px - sl) * vol * SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
 
-   if(!g_trade.PositionClose(ticket, (ulong)MathMax(0, slippage_points)))
-   {
-      PrintFormat("V12_EA: PositionClose failed ticket=%I64u retcode=%u (%s)",
-                  ticket, g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+   if(!V12_ClosePositionByTicket(ticket, pos_type, vol))
       return false;
-   }
 
    RecordClosedPosition(pos_id, reason, risk_for_trade);
    g_active_ticket    = 0;
@@ -520,20 +587,11 @@ bool OpenMarketPosition(int dir, const string eid, double sl_raw, double tp_raw)
    if(!CalculateOrderLot(entry_est, sl_norm, eid, lot, trade_risk_usd))
       return false;
 
-   bool ok = false;
-   if(dir > 0)
-      ok = g_trade.Buy(lot, _Symbol, ask, sl_norm, tp_norm, eid);
-   else
-      ok = g_trade.Sell(lot, _Symbol, bid, sl_norm, tp_norm, eid);
-
-   if(!ok)
-   {
-      PrintFormat("V12_EA: Order %s failed retcode=%u (%s)",
-                  eid, g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
+   double fill_px = 0.0;
+   ENUM_ORDER_TYPE otype = (dir > 0) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   if(!V12_SendMarketOrder(otype, lot, entry_est, sl_norm, tp_norm, eid, fill_px))
       return false;
-   }
 
-   double fill_px = g_trade.ResultPrice();
    if(fill_px <= 0.0)
       fill_px = entry_est;
 
@@ -903,17 +961,12 @@ void OnTick()
 
             if(improved && valid_dist)
             {
-               if(g_trade.PositionModify(cur_ticket, new_sl, 0.0))
+               if(V12_ModifyPositionSLTP(cur_ticket, new_sl, 0.0))
                {
                   string mod_msg = StringFormat("[V12 %s] SL MODIFIED (%s): %.2f -> %.2f",
                                                 _Symbol, g_state.eid, cur_sl, new_sl);
                   Print("V12_EA: ", mod_msg);
                   SendTelegram(mod_msg);
-               }
-               else
-               {
-                  PrintFormat("V12_EA: SL modify failed retcode=%u (%s)",
-                              g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
                }
             }
          }
@@ -938,17 +991,12 @@ void OnTick()
 
             if((sl_changed || tp_changed) && sl_valid && tp_valid)
             {
-               if(g_trade.PositionModify(cur_ticket, new_sl, new_tp))
+               if(V12_ModifyPositionSLTP(cur_ticket, new_sl, new_tp))
                {
                   string mod_msg = StringFormat("[V12 %s] REV SL/TP MODIFIED (%s): SL %.2f->%.2f | TP %.2f->%.2f",
                                                 _Symbol, g_state.eid, cur_sl, new_sl, cur_tp, new_tp);
                   Print("V12_EA: ", mod_msg);
                   SendTelegram(mod_msg);
-               }
-               else
-               {
-                  PrintFormat("V12_EA: Rev SL/TP modify failed retcode=%u (%s)",
-                              g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription());
                }
             }
          }
