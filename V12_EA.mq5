@@ -71,6 +71,16 @@ double         g_cum_R              = 0.0;
 double         g_peak_R             = 0.0;
 bool           g_halted             = false;
 
+uint           g_last_retcode       = 0;
+datetime       g_pend_bar_time      = 0;
+bool           g_pend_close_hook    = false;
+bool           g_pend_close_rev_time = false;
+int            g_pend_open_rev_dir  = 0;
+bool           g_pend_go_long       = false;
+bool           g_pend_go_short      = false;
+datetime       g_sltp_synced_bar    = 0;
+datetime       g_retry_after_time   = 0;
+
 const int      V12_REPLAY_BARS      = 3200; // Replayed closed bars (> 3,000 required)
 
 //+------------------------------------------------------------------+
@@ -187,15 +197,49 @@ void ConfigureTradeObject()
       g_filling_mode = ORDER_FILLING_RETURN;
 }
 
+bool IsMarketClosedError()
+{
+   return (g_last_retcode == TRADE_RETCODE_MARKET_CLOSED);
+}
+
+bool IsTradeSessionOpen()
+{
+   if(SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
+      return false;
+
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   int cur_sec = dt.hour * 3600 + dt.min * 60 + dt.sec;
+
+   for(int s = 0; s < 10; s++)
+   {
+      datetime from_dt = 0, to_dt = 0;
+      if(!SymbolInfoSessionTrade(_Symbol, (ENUM_DAY_OF_WEEK)dt.day_of_week, s, from_dt, to_dt))
+         return (s == 0);
+
+      int from_sec = (int)(from_dt % 86400);
+      int to_sec   = (int)(to_dt % 86400);
+      if(to_sec == 0 && to_dt > from_dt)
+         to_sec = 86400;
+
+      if(cur_sec >= from_sec && cur_sec < to_sec)
+         return true;
+   }
+   return false;
+}
+
 bool SendOrderChecked(const MqlTradeRequest &req, MqlTradeResult &res, const string action_name)
 {
    ZeroMemory(res);
+   g_last_retcode = 0;
    if(!OrderSend(req, res))
    {
+      g_last_retcode = res.retcode;
       PrintFormat("V12_EA: %s OrderSend failed err=%d retcode=%u (%s)",
                   action_name, GetLastError(), res.retcode, res.comment);
       return false;
    }
+   g_last_retcode = res.retcode;
    if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
    {
       PrintFormat("V12_EA: %s rejected retcode=%u (%s)", action_name, res.retcode, res.comment);
@@ -512,6 +556,7 @@ void RecordClosedPosition(long pos_id, const string exit_reason, double known_in
 //+------------------------------------------------------------------+
 bool CloseActivePosition(const string reason)
 {
+   g_last_retcode = 0;
    ulong ticket; long pos_id; ENUM_POSITION_TYPE pos_type;
    double sl, tp, open_px, vol; datetime open_time; string comment;
 
@@ -540,6 +585,7 @@ bool CloseActivePosition(const string reason)
 //+------------------------------------------------------------------+
 bool OpenMarketPosition(int dir, const string eid, double sl_raw, double tp_raw)
 {
+   g_last_retcode = 0;
    if(g_halted)
    {
       string msg = StringFormat("[V12 %s] ENTRY BLOCKED (%s): Kill switch active (DD=%.2fR >= %.2fR)",
@@ -693,7 +739,15 @@ bool RebuildStateFromHistory()
       V12_StepBar(b, g_bar_t, high, low, close, sd, g_params, false, g_state, act);
    }
 
-   g_last_bar_time = rates[0].time;
+   g_last_bar_time      = rates[0].time;
+   g_sltp_synced_bar    = g_last_bar_time;
+   g_pend_bar_time      = 0;
+   g_pend_close_hook    = false;
+   g_pend_close_rev_time = false;
+   g_pend_open_rev_dir  = 0;
+   g_pend_go_long       = false;
+   g_pend_go_short      = false;
+   g_retry_after_time   = 0;
 
    // Reconcile with live broker position (truth overrides simulation)
    ulong ticket; long pos_id; ENUM_POSITION_TYPE pos_type;
@@ -843,164 +897,312 @@ int OnInit()
 void OnTick()
 {
    datetime cur_closed_time = iTime(_Symbol, PERIOD_H1, 1);
-   if(cur_closed_time == 0 || cur_closed_time == g_last_bar_time)
+   if(cur_closed_time == 0)
       return;
 
-   // Check if an active broker position closed via SL/TP during the bar that just finished
    ulong cur_ticket = 0; long cur_pos_id = 0; ENUM_POSITION_TYPE cur_type = POSITION_TYPE_BUY;
    double cur_sl = 0.0, cur_tp = 0.0, cur_open_px = 0.0, cur_vol = 0.0;
    datetime cur_open_time = 0; string cur_comment = "";
-   bool has_pos = FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
-                                   cur_open_px, cur_open_time, cur_vol, cur_comment);
+   bool has_pos = false;
 
+   // Evaluate closed H1 bar once when bar closes
+   if(cur_closed_time != g_last_bar_time)
+   {
+      has_pos = FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
+                                 cur_open_px, cur_open_time, cur_vol, cur_comment);
+
+      if(!has_pos && g_active_pos_id > 0)
+      {
+         RecordClosedPosition(g_active_pos_id, "", g_active_init_risk);
+         g_active_ticket       = 0;
+         g_active_pos_id       = 0;
+         g_active_init_risk    = 0.0;
+         g_state.pos_dir       = 0;
+         g_state.eid           = "";
+         g_pend_close_hook     = false;
+         g_pend_close_rev_time = false;
+         SaveActivePosGlobals();
+      }
+      else if(has_pos)
+      {
+         g_active_ticket = cur_ticket;
+         g_active_pos_id = cur_pos_id;
+         g_state.pos_dir = (cur_type == POSITION_TYPE_BUY) ? 1 : -1;
+         g_state.eid     = ParseEntryId(cur_comment, cur_type, cur_tp);
+      }
+
+      int need_bars = V12_REPLAY_BARS + V12_MinWarmupBars(g_params) + 50;
+      int avail     = iBars(_Symbol, PERIOD_H1) - 1;
+      int copy_cnt  = MathMin(need_bars, avail);
+
+      MqlRates rates[];
+      double open[], high[], low[], close[];
+      if(!CopyClosedH1Bars(copy_cnt, rates, open, high, low, close))
+         return; // wait for next tick if history isn't ready
+
+      V12_SeriesData sd;
+      if(!V12_ComputeAllSeries(high, low, close, copy_cnt, g_params, sd))
+         return;
+
+      g_last_bar_time = cur_closed_time;
+      g_bar_t++;
+
+      V12_BarActions act;
+      V12_StepBar(0, g_bar_t, high, low, close, sd, g_params, true, g_state, act);
+
+      // Telegram skip notifications
+      if(act.skip_long || act.skip_short)
+      {
+         string skip_msg = StringFormat("[V12 %s] SKIP %s (DF hook cooldown active) @ %.2f",
+                                        _Symbol, (act.skip_long ? "Trend L" : "Trend S"), close[0]);
+         Print("V12_EA: ", skip_msg);
+         SendTelegram(skip_msg);
+      }
+
+      g_pend_bar_time = cur_closed_time;
+      if(act.close_trend_hook)
+         g_pend_close_hook = true;
+      if(act.close_rev_time)
+         g_pend_close_rev_time = true;
+
+      g_pend_open_rev_dir = act.open_rev_dir;
+      if(act.open_rev_dir != 0)
+         g_pend_close_hook = false;
+
+      g_pend_go_long  = act.go_long;
+      g_pend_go_short = act.go_short;
+   }
+
+   bool has_pending = g_pend_close_hook || g_pend_close_rev_time ||
+                      (g_pend_open_rev_dir != 0) || g_pend_go_long || g_pend_go_short ||
+                      (g_sltp_synced_bar != cur_closed_time);
+   if(!has_pending)
+      return;
+
+   if(!IsTradeSessionOpen() || TimeCurrent() < g_retry_after_time)
+      return;
+
+   // Step 10: Apply pending exits, reversals, entries, and SL/TP updates when market is open
+   has_pos = FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
+                              cur_open_px, cur_open_time, cur_vol, cur_comment);
    if(!has_pos && g_active_pos_id > 0)
    {
       RecordClosedPosition(g_active_pos_id, "", g_active_init_risk);
-      g_active_ticket    = 0;
-      g_active_pos_id    = 0;
-      g_active_init_risk = 0.0;
-      g_state.pos_dir    = 0;
-      g_state.eid        = "";
+      g_active_ticket       = 0;
+      g_active_pos_id       = 0;
+      g_active_init_risk    = 0.0;
+      g_state.pos_dir       = 0;
+      g_state.eid           = "";
+      g_pend_close_hook     = false;
+      g_pend_close_rev_time = false;
       SaveActivePosGlobals();
    }
-   else if(has_pos)
-   {
-      g_active_ticket = cur_ticket;
-      g_active_pos_id = cur_pos_id;
-      g_state.pos_dir = (cur_type == POSITION_TYPE_BUY) ? 1 : -1;
-      g_state.eid     = ParseEntryId(cur_comment, cur_type, cur_tp);
-   }
 
-   int need_bars = V12_REPLAY_BARS + V12_MinWarmupBars(g_params) + 50;
-   int avail     = iBars(_Symbol, PERIOD_H1) - 1;
-   int copy_cnt  = MathMin(need_bars, avail);
-
-   MqlRates rates[];
-   double open[], high[], low[], close[];
-   if(!CopyClosedH1Bars(copy_cnt, rates, open, high, low, close))
-      return; // wait for next tick if history isn't ready
-
-   V12_SeriesData sd;
-   if(!V12_ComputeAllSeries(high, low, close, copy_cnt, g_params, sd))
-      return;
-
-   g_last_bar_time = cur_closed_time;
-   g_bar_t++;
-
-   V12_BarActions act;
-   V12_StepBar(0, g_bar_t, high, low, close, sd, g_params, true, g_state, act);
-
-   // Telegram skip notifications
-   if(act.skip_long || act.skip_short)
-   {
-      string skip_msg = StringFormat("[V12 %s] SKIP %s (DF hook cooldown active) @ %.2f",
-                                     _Symbol, (act.skip_long ? "Trend L" : "Trend S"), close[0]);
-      Print("V12_EA: ", skip_msg);
-      SendTelegram(skip_msg);
-   }
-
-   // Step 10: Apply exits, reversals, entries, and SL/TP updates on first tick of bar t+1
    bool opened_this_bar = false;
 
-   if(act.close_trend_hook)
+   if(g_pend_close_hook)
    {
-      CloseActivePosition("DF hook");
-   }
-
-   if(act.open_rev_dir != 0)
-   {
-      bool closed_ok = true;
-      if(has_pos)
-         closed_ok = CloseActivePosition(act.open_rev_dir == 1 ? "Rev L" : "Rev S");
-
-      if(closed_ok)
+      if(!has_pos || CloseActivePosition("DF hook"))
       {
-         string rev_eid = (act.open_rev_dir == 1) ? "RL" : "RS";
-         opened_this_bar = OpenMarketPosition(act.open_rev_dir, rev_eid, g_state.r_stop, g_state.r_tgt);
+         g_pend_close_hook = false;
+         has_pos = false;
+      }
+      else if(IsMarketClosedError())
+      {
+         g_retry_after_time = TimeCurrent() + 60;
+         return;
+      }
+      else
+      {
+         g_pend_close_hook = false;
       }
    }
 
-   if(act.go_long || act.go_short)
+   if(g_pend_open_rev_dir != 0)
    {
-      int    dir = act.go_long ? 1 : -1;
-      string eid = act.go_long ? "L" : "S";
-      opened_this_bar = OpenMarketPosition(dir, eid, g_state.stop_px, 0.0);
+      if(cur_closed_time != g_pend_bar_time)
+      {
+         g_pend_open_rev_dir = 0;
+      }
+      else
+      {
+         bool closed_ok = true;
+         if(has_pos)
+            closed_ok = CloseActivePosition(g_pend_open_rev_dir == 1 ? "Rev L" : "Rev S");
+
+         if(!closed_ok)
+         {
+            if(IsMarketClosedError())
+            {
+               g_retry_after_time = TimeCurrent() + 60;
+               return;
+            }
+            g_pend_open_rev_dir = 0;
+         }
+         else
+         {
+            has_pos = false;
+            g_last_retcode = 0;
+            string rev_eid = (g_pend_open_rev_dir == 1) ? "RL" : "RS";
+            if(OpenMarketPosition(g_pend_open_rev_dir, rev_eid, g_state.r_stop, g_state.r_tgt))
+            {
+               opened_this_bar     = true;
+               g_pend_open_rev_dir = 0;
+               g_sltp_synced_bar   = cur_closed_time;
+            }
+            else if(IsMarketClosedError())
+            {
+               g_retry_after_time = TimeCurrent() + 60;
+               return;
+            }
+            else
+            {
+               g_pend_open_rev_dir = 0;
+            }
+         }
+      }
    }
 
-   if(act.close_rev_time)
+   if(g_pend_go_long || g_pend_go_short)
    {
-      CloseActivePosition("Rev time");
+      if(cur_closed_time != g_pend_bar_time)
+      {
+         g_pend_go_long  = false;
+         g_pend_go_short = false;
+      }
+      else
+      {
+         int    dir = g_pend_go_long ? 1 : -1;
+         string eid = g_pend_go_long ? "L" : "S";
+         g_last_retcode = 0;
+         if(OpenMarketPosition(dir, eid, g_state.stop_px, 0.0))
+         {
+            opened_this_bar   = true;
+            g_pend_go_long    = false;
+            g_pend_go_short   = false;
+            g_sltp_synced_bar = cur_closed_time;
+         }
+         else if(IsMarketClosedError())
+         {
+            g_retry_after_time = TimeCurrent() + 60;
+            return;
+         }
+         else
+         {
+            g_pend_go_long  = false;
+            g_pend_go_short = false;
+         }
+      }
+   }
+
+   if(g_pend_close_rev_time)
+   {
+      if(!has_pos || CloseActivePosition("Rev time"))
+      {
+         g_pend_close_rev_time = false;
+         has_pos = false;
+      }
+      else if(IsMarketClosedError())
+      {
+         g_retry_after_time = TimeCurrent() + 60;
+         return;
+      }
+      else
+      {
+         g_pend_close_rev_time = false;
+      }
    }
 
    // Manage SL / TP on any remaining open position (once per closed bar)
-   if(!opened_this_bar && FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
-                                           cur_open_px, cur_open_time, cur_vol, cur_comment))
+   if(g_sltp_synced_bar != cur_closed_time)
    {
-      double bid        = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double ask        = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double stops_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-
-      if(g_state.eid == "L" || g_state.eid == "S")
+      bool sltp_need_retry = false;
+      if(!opened_this_bar && FindOpenPosition(cur_ticket, cur_pos_id, cur_type, cur_sl, cur_tp,
+                                              cur_open_px, cur_open_time, cur_vol, cur_comment))
       {
-         double new_sl = NormalizeDouble(g_state.stop_px, _Digits);
+         double bid        = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double ask        = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double stops_dist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
 
-         // If t+1 open has already crossed the trailed stop, close immediately to match Pine
-         if((cur_type == POSITION_TYPE_BUY && bid <= new_sl) ||
-            (cur_type == POSITION_TYPE_SELL && ask >= new_sl))
+         if(g_state.eid == "L" || g_state.eid == "S")
          {
-            CloseActivePosition("Trend exit");
-         }
-         else
-         {
-            bool improved = (cur_type == POSITION_TYPE_BUY)
-                            ? (new_sl > cur_sl + _Point * 0.5)
-                            : (cur_sl == 0.0 || new_sl < cur_sl - _Point * 0.5);
-            bool valid_dist = (cur_type == POSITION_TYPE_BUY)
-                              ? (bid - new_sl >= stops_dist)
-                              : (new_sl - ask >= stops_dist);
+            double new_sl = NormalizeDouble(g_state.stop_px, _Digits);
 
-            if(improved && valid_dist)
+            // If t+1 open has already crossed the trailed stop, close immediately to match Pine
+            if((cur_type == POSITION_TYPE_BUY && bid <= new_sl) ||
+               (cur_type == POSITION_TYPE_SELL && ask >= new_sl))
             {
-               if(V12_ModifyPositionSLTP(cur_ticket, new_sl, 0.0))
+               if(!CloseActivePosition("Trend exit") && IsMarketClosedError())
+                  sltp_need_retry = true;
+            }
+            else
+            {
+               bool improved = (cur_type == POSITION_TYPE_BUY)
+                               ? (new_sl > cur_sl + _Point * 0.5)
+                               : (cur_sl == 0.0 || new_sl < cur_sl - _Point * 0.5);
+               bool valid_dist = (cur_type == POSITION_TYPE_BUY)
+                                 ? (bid - new_sl >= stops_dist)
+                                 : (new_sl - ask >= stops_dist);
+
+               if(improved && valid_dist)
                {
-                  string mod_msg = StringFormat("[V12 %s] SL MODIFIED (%s): %.2f -> %.2f",
-                                                _Symbol, g_state.eid, cur_sl, new_sl);
-                  Print("V12_EA: ", mod_msg);
-                  SendTelegram(mod_msg);
+                  if(V12_ModifyPositionSLTP(cur_ticket, new_sl, 0.0))
+                  {
+                     string mod_msg = StringFormat("[V12 %s] SL MODIFIED (%s): %.2f -> %.2f",
+                                                   _Symbol, g_state.eid, cur_sl, new_sl);
+                     Print("V12_EA: ", mod_msg);
+                     SendTelegram(mod_msg);
+                  }
+                  else if(IsMarketClosedError())
+                  {
+                     sltp_need_retry = true;
+                  }
+               }
+            }
+         }
+         else if(g_state.eid == "RL" || g_state.eid == "RS")
+         {
+            double new_sl = NormalizeDouble(g_state.r_stop, _Digits);
+            double new_tp = NormalizeDouble(g_state.r_tgt, _Digits);
+
+            bool hit_now = (cur_type == POSITION_TYPE_BUY && (bid <= new_sl || (new_tp > 0.0 && bid >= new_tp))) ||
+                           (cur_type == POSITION_TYPE_SELL && (ask >= new_sl || (new_tp > 0.0 && ask <= new_tp)));
+            if(hit_now)
+            {
+               if(!CloseActivePosition("Rev exit") && IsMarketClosedError())
+                  sltp_need_retry = true;
+            }
+            else
+            {
+               bool sl_changed = MathAbs(new_sl - cur_sl) >= _Point * 0.5;
+               bool tp_changed = MathAbs(new_tp - cur_tp) >= _Point * 0.5;
+               bool sl_valid   = (cur_type == POSITION_TYPE_BUY) ? (bid - new_sl >= stops_dist) : (new_sl - ask >= stops_dist);
+               bool tp_valid   = (new_tp == 0.0) || ((cur_type == POSITION_TYPE_BUY) ? (new_tp - ask >= stops_dist) : (bid - new_tp >= stops_dist));
+
+               if((sl_changed || tp_changed) && sl_valid && tp_valid)
+               {
+                  if(V12_ModifyPositionSLTP(cur_ticket, new_sl, new_tp))
+                  {
+                     string mod_msg = StringFormat("[V12 %s] REV SL/TP MODIFIED (%s): SL %.2f->%.2f | TP %.2f->%.2f",
+                                                   _Symbol, g_state.eid, cur_sl, new_sl, cur_tp, new_tp);
+                     Print("V12_EA: ", mod_msg);
+                     SendTelegram(mod_msg);
+                  }
+                  else if(IsMarketClosedError())
+                  {
+                     sltp_need_retry = true;
+                  }
                }
             }
          }
       }
-      else if(g_state.eid == "RL" || g_state.eid == "RS")
+
+      if(sltp_need_retry)
       {
-         double new_sl = NormalizeDouble(g_state.r_stop, _Digits);
-         double new_tp = NormalizeDouble(g_state.r_tgt, _Digits);
-
-         bool hit_now = (cur_type == POSITION_TYPE_BUY && (bid <= new_sl || (new_tp > 0.0 && bid >= new_tp))) ||
-                        (cur_type == POSITION_TYPE_SELL && (ask >= new_sl || (new_tp > 0.0 && ask <= new_tp)));
-         if(hit_now)
-         {
-            CloseActivePosition("Rev exit");
-         }
-         else
-         {
-            bool sl_changed = MathAbs(new_sl - cur_sl) >= _Point * 0.5;
-            bool tp_changed = MathAbs(new_tp - cur_tp) >= _Point * 0.5;
-            bool sl_valid   = (cur_type == POSITION_TYPE_BUY) ? (bid - new_sl >= stops_dist) : (new_sl - ask >= stops_dist);
-            bool tp_valid   = (new_tp == 0.0) || ((cur_type == POSITION_TYPE_BUY) ? (new_tp - ask >= stops_dist) : (bid - new_tp >= stops_dist));
-
-            if((sl_changed || tp_changed) && sl_valid && tp_valid)
-            {
-               if(V12_ModifyPositionSLTP(cur_ticket, new_sl, new_tp))
-               {
-                  string mod_msg = StringFormat("[V12 %s] REV SL/TP MODIFIED (%s): SL %.2f->%.2f | TP %.2f->%.2f",
-                                                _Symbol, g_state.eid, cur_sl, new_sl, cur_tp, new_tp);
-                  Print("V12_EA: ", mod_msg);
-                  SendTelegram(mod_msg);
-               }
-            }
-         }
+         g_retry_after_time = TimeCurrent() + 60;
+         return;
       }
+      g_sltp_synced_bar = cur_closed_time;
    }
 }
 
