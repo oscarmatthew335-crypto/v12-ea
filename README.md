@@ -315,3 +315,62 @@ All `5` remaining `:02` mismatches in `985f8.csv` (and `de175 #038`) occur where
 | `#244` | `2026-11-12 12:02` | `2026-11-12 10:00` | `BUY` `Rev L` | `3944.13` | `BLOCKED_OPP_DIR` | Post-cutoff `2026-11-12` | :00 `(C=3943.83, sig='')`; after M1 range |
 
 </details>
+
+---
+
+### F. Long-History Backtest (`2010.01.01`–`2026.11.11`, Dukascopy M1 Custom Symbol)
+
+#### 1. Earliest Native IC Markets `XAUUSD` History & Custom Symbol Import (`XAUUSD_DUKA`)
+- Inspected native `ICMarketsSC-Demo` `XAUUSD` history across `2008–2026` (`CopyRates("XAUUSD", PERIOD_H1, ...)` and `Tester\logs\20261114.log`):
+  - `SERIES_SERVER_FIRSTDATE` reports `2008.03.06 00:00`, **however `2008–2015` contains only daily (`00:00`) placeholder bars** (`214–311` H1 bars/year, `0` intraday hours).
+  - Earliest true intraday `H1` history on `ICMarketsSC-Demo` begins **`2016.01.18 02:00`** (after 2015).
+- Imported Dukascopy/HistData `XAUUSD` M1 history (`2009.03.16–2024.12.31` from `fokan/xauusd-2009-2026`, providing full `3,250`-bar `H1` warmup on `2010.01.01`) into MT5 custom symbol `XAUUSD_DUKA`:
+  - Aligned `America/New_York` M1 timestamps to IC Markets server time (`Europe/Athens`, EU DST `UTC+2`/`UTC+3`): `+7h` (`+25,200s`) year-round except `+8h` (`+28,800s`) during the March (`2nd Sun Mar` to `last Sun Mar`) and October/November (`last Sun Oct` to `1st Sun Nov`) US-vs-EU DST transition weeks (verified median open-price diff against IC Markets M1 of `$0.17–$0.31` across all seasons).
+  - Patched `46,236` missing minutes in `2021–2024` (including Feb–Jul 2023 gaps) and populated `2025.01.01–2026.11.11` from exported `ICMarketsSC-Demo` M1 bars (ensuring `tick_volume >= 60` so MT5 `"1 minute OHLC"` generates all 4 `O/H/L/C` ticks per M1 bar, `10`-point spread for 2009–2024 Dukascopy rows, actual IC spread for patched/2025–2026 rows). Total imported: **`6,232,902` M1 bars** (`2009.03.16 01:00` – `2026.11.11 23:58`).
+
+#### 2. Per-Year Performance (`2010.01.01`–`2026.11.11`, Model `"1 minute OHLC"`)
+Settings: `XAUUSD_DUKA`, `H1`, Model `"1 minute OHLC"` (`Model=1`), `$10,000.00` deposit, `lot_mode = LOT_FIXED`, `fixed_lot = 0.01`, `max_loss_usd = 100.0`, and `halt_dd_R = 0.0` (**for this test only** so the kill switch did not stop the run; `V12_EA.mq5` default remains `20.0`, all other inputs default). Metrics are computed over the `2,055` EA-closed trades (matching `OnDeinit`: `CumR = +151.83 R`, `MaxDD_R = 65.50 R`; MT5 Strategy Tester `.htm` additionally includes `1` open short entered `2026.11.10 21:00` and force-closed at `end of test` (`23:58:59`, `-$5.79` / `-0.16 R`), giving `2,056` total trades, `$3,528.69` net profit, `PF($) = 1.39`, Max Balance DD `$421.96 (4.07%)`, Max Equity DD `$428.78 (4.13%)`):
+
+| Year | Trades | Win % | Profit Factor (`R`) | Profit Factor (`$`) | Net `R` | Net `$` | Max DD (`R`) | Longest Losing Streak (Months) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2010 | 108 | 37.0% | 1.23 | 1.32 | +10.09 R | +$89.99 | 8.46 R | 2 |
+| 2011 | 117 | 35.0% | 1.14 | 1.05 | +6.94 R | +$30.15 | 8.92 R | 1 |
+| 2012 | 115 | 28.7% | 1.13 | 1.01 | +6.72 R | +$2.54 | 15.60 R | 3 |
+| 2013 | 105 | 33.3% | 1.31 | 1.13 | +14.00 R | +$51.07 | 10.68 R | 4 |
+| 2014 | 117 | 33.3% | 1.50 | 1.42 | +23.67 R | +$116.89 | 10.13 R | 2 |
+| 2015 | 108 | 31.5% | 0.92 | 0.85 | -4.34 R | -$45.89 | 20.44 R | 6 (`2015-02`–`2015-07`) |
+| 2016 | 124 | 29.8% | 0.92 | 1.00 | -4.65 R | +$0.75 | 12.79 R | 5 (`2016-02`–`2016-06`) |
+| 2017 | 122 | 40.2% | 1.35 | 1.52 | +16.74 R | +$105.94 | 7.52 R | 2 |
+| 2018 | 144 | 25.7% | 0.70 | 0.69 | -24.00 R | -$105.89 | 31.71 R | 8 (`2018-05`–`2018-12`) |
+| 2019 | 123 | 31.7% | 0.69 | 0.71 | -19.81 R | -$98.74 | 20.27 R | 5 (`2019-01`–`2019-05`) |
+| 2020 | 128 | 25.0% | 0.90 | 0.86 | -6.18 R | -$101.86 | 17.78 R | 5 (`2020-08`–`2020-12`) |
+| 2021 | 119 | 26.1% | 1.19 | 1.17 | +10.39 R | +$80.22 | 11.04 R | 3 |
+| 2022 | 151 | 30.5% | 0.79 | 0.76 | -15.78 R | -$154.73 | 25.30 R | 5 (`2022-08`–`2022-12`) |
+| 2023 | 113 | 36.3% | 1.25 | 1.17 | +12.29 R | +$70.36 | 15.23 R | 3 |
+| 2024 | 124 | 32.3% | 1.28 | 1.37 | +16.55 R | +$248.26 | 13.67 R | 2 |
+| 2025 | 128 | 42.2% | 1.66 | 1.71 | +34.71 R | +$748.82 | 6.07 R | 2 |
+| 2026 *(to 11.11)* | 109 | 49.5% | 2.82 | 2.73 | +74.46 R | +$2,496.60 | 4.89 R | 1 |
+| **Total (`2010–2026`)** | **2,055** *(2,056 HTM)* | **33.2%** | **1.16** | **1.40** *(1.39 HTM)* | **+151.83 R** | **+$3,534.48** *(+$3,528.69 HTM)* | **65.50 R** | **13** (`2018-05`–`2019-05`) |
+
+- **Streak & Drawdown Notes**:
+  - **Longest Losing Streak (Consecutive Negative-`R` Calendar Months)**: **`13` consecutive months** from **`2018-05` through `2019-05`** (`-5.36, -3.19, -4.80, -5.01, -0.51, -3.53, -2.63, -4.60, -3.89, -0.85, -2.88, -2.18, -4.22 R`, broken in `2019-06` with `+2.81 R`).
+  - **Global Peak-to-Trough Drawdown**: Cumulative `R` peaked at **`+76.25 R`** (`2018-05-15`), troughed at **`+10.75 R`** (`2023-08-28`, **`65.50 R` max drawdown**), and remained underwater below the `+76.25 R` peak for **`89` calendar months (`2,767` days / `~90.9` months)** until recovering to new highs on `2025-12-12`. (Notice `PF($)` exceeds `PF(R)` in `Total` solely because fixed `0.01` lots scale linearly with gold's rise from `~$1,100` in 2010 to `~$4,000+` in 2026.)
+
+---
+
+### G. H1 Minute-Offset Sensitivity Test (`2025.01.01`–`2026.11.11`)
+
+Rebuilt `H1` candles from IC Markets M1 (`1,015,761` M1 bars, `2024.01.02–2026.11.11`, providing full 2024 warmup before `2025.01.01`) at 7 minute offsets (`:00`, `:05`, `:10`, `:15`, `:20`, `:30`, `:45`) by shifting M1 timestamps `-mm` minutes inside custom symbols `XAUUSD_M00`–`XAUUSD_M45` so MT5 Strategy Tester builds each `H1` bar from `[HH:mm, (HH+1):mm)` and executes `"1 minute OHLC"` intrabar ticks inside that exact window. Settings: `H1`, Model `"1 minute OHLC"` (`Model=1`), `Fixed 0.01`, `max_loss_usd = 100.0`, `halt_dd_R = 0.0`:
+
+| H1 Offset | Trades *(HTM)* | Win % | Net `R` | Net Profit `$` *(HTM)* | Profit Factor (`R`) | Profit Factor (`$` HTM) | Max DD (`R`) | Max Equity DD (`$` HTM) | Max Balance DD (`$` HTM) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`:00`** | 237 *(238)* | 45.6% | **+109.18 R** | +$3,245.42 *(+$3,239.63)* | **2.16** | **2.29** | **6.07 R** | $345.39 | $174.26 |
+| **`:05`** | 240 *(241)* | 41.7% | **+79.49 R** | +$2,145.88 *(+$2,140.42)* | **1.78** | **1.82** | **9.26 R** | $353.43 | $295.73 |
+| **`:10`** | 247 *(248)* | 40.9% | **+59.21 R** | +$1,444.29 *(+$1,441.82)* | **1.56** | **1.48** | **8.81 R** | $486.87 | $332.61 |
+| **`:15`** | 251 *(252)* | 41.0% | **+73.18 R** | +$2,232.81 *(+$2,229.63)* | **1.67** | **1.77** | **10.29 R** | $332.28 | $285.36 |
+| **`:20`** | 238 *(239)* | 39.5% | **+73.58 R** | +$1,906.88 *(+$1,903.56)* | **1.71** | **1.67** | **12.98 R** | $400.88 | $367.94 |
+| **`:30`** | 247 *(248)* | 38.1% | **+58.78 R** | +$1,940.35 *(+$1,937.54)* | **1.52** | **1.66** | **16.57 R** | $404.66 | $387.05 |
+| **`:45`** | 246 *(247)* | 41.5% | **+81.57 R** | +$2,279.04 *(+$2,278.74)* | **1.80** | **1.86** | **8.65 R** | $377.67 | $279.78 |
+
+- **Takeaway**: Every tested H1 boundary offset remained solidly profitable over `2025.01.01–2026.11.11` (`+58.78 R` to `+109.18 R`, `PF(R) = 1.52–2.16`, `MaxDD_R = 6.07–16.57 R`), confirming the edge is not an artifact of `:00` bar alignment alone, though `:00` (`+109.18 R`, `PF 2.16`, `MaxDD 6.07 R`) outperforms mid-hour boundaries (`:10`–`:30`, `~+58.8–73.6 R`), likely because institutional hourly opens and London/NY hour boundaries concentrate liquidity at the top of the hour.
+
