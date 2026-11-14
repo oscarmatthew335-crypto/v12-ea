@@ -1,0 +1,14 @@
+# Compiled MQL5 binaries
+*.ex5
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Local preset files (may contain Telegram tokens or chat IDs)
+*.set
+
+# Debug / Strategy Tester output CSVs
+V12_Debug_Output*.csv
+tester_trades*.csv
+*.tst

@@ -1,0 +1,275 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// V12 Strategy: backtest version of BO_CONT_IND v3 (live indicator), same defaults.
+// Trend trades : 20-bar range break + retest, 200 EMA filter, 2 x ATR initial stop,
+//                stop trails the lowest low / highest high of the last N bars (setting below).
+// DF hook      : closes the trend trade (flatness 0.07) and pauses new trend entries for 10 bars.
+// Reversal     : when the hook closes a trend trade, take the opposite trade
+//                (stop beyond the last 5 bars' extreme + 0.25 ATR, target the trend EMA, close after 24 bars).
+// Costs pre-set (commission 0.0035% per side + 5 ticks slippage). Adjust in Properties.
+
+//@version=5
+strategy("V12 Strategy", shorttitle="V12_STRAT", overlay=true, pyramiding=0, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.0035, slippage=5)
+
+// ---------------------------
+// 1. Inputs
+// ---------------------------
+grp_sl     = "Stop loss (trend trades)"
+trail_len  = input.int(10, "Trailing stop: lowest low / highest high of the last (bars)", minval=1, group=grp_sl, tooltip="After each bar the stop moves to the lowest low (longs) or highest high (shorts) of this many bars, only ever toward profit. Smaller = tighter, gives back less, but gets shaken out more.")
+sl_atr     = input.float(2.0, "Initial stop (x ATR)", minval=0.1, step=0.1, group=grp_sl)
+atr_len    = input.int(14, "ATR length", minval=1, group=grp_sl)
+exit_mode  = input.string("Trailing channel", "Exit", options=["Trailing channel", "Fixed R", "One-step lock"], group=grp_sl)
+rr         = input.float(2.0, "Fixed R target", minval=0.5, step=0.5, group=grp_sl)
+lock_trg   = input.float(1.5, "One-step lock: trigger (R in profit)", minval=0.25, step=0.25, group=grp_sl)
+lock_at    = input.float(0.5, "One-step lock: move stop to (R locked)", minval=0.0, step=0.25, group=grp_sl)
+
+grp_b      = "Breakout"
+bo_len     = input.int(20, "Breakout range (bars)", minval=5, group=grp_b)
+entry_mode = input.string("Retest", "Entry", options=["Retest", "Break"], group=grp_b)
+retest_win = input.int(10, "Retest must happen within (bars)", minval=1, group=grp_b)
+retest_tol = input.float(0.25, "Retest tolerance (x ATR)", minval=0.0, step=0.05, group=grp_b)
+
+grp_t      = "Trend filter"
+use_trend  = input.bool(true, "Trade only with the EMA trend", group=grp_t)
+ema_len    = input.int(200, "EMA length", minval=10, group=grp_t)
+
+grp_df     = "DF climax filter (TVR_TENSION hook)"
+df_mode    = input.string("Both", "Use DF hook", options=["Off", "Skip entries after a hook", "Exit on a hook", "Both"], group=grp_df)
+hook_lb    = input.int(10, "Skip entries for (bars after a hook)", minval=1, group=grp_df)
+df_len     = input.int(100, "DF window", minval=20, group=grp_df)
+df_tol     = input.float(0.07, "Flatness tolerance", step=0.01, group=grp_df)
+norm_len   = input.int(200, "Percentile lookback", minval=50, group=grp_df)
+pct_cut    = input.float(85.0, "Percentile cutoff (%)", minval=50.0, maxval=99.0, step=1.0, group=grp_df)
+
+grp_r      = "DF reversal trades"
+rev_mode   = input.string("Only after a V12 hook exit", "Reversal trade on a DF hook", options=["Off", "Only after a V12 hook exit", "On every hook"], group=grp_r)
+rev_sbars  = input.int(5, "Reversal stop beyond the extreme of the last (bars)", minval=1, group=grp_r)
+rev_buf    = input.float(0.25, "Reversal stop buffer (x ATR)", minval=0.0, step=0.05, group=grp_r)
+rev_tmode  = input.string("Trend EMA", "Reversal target", options=["Trend EMA", "Fixed R"], group=grp_r)
+rev_rr     = input.float(1.5, "Reversal Fixed R target", minval=0.5, step=0.25, group=grp_r)
+rev_max    = input.int(24, "Close a reversal after (bars) if still open", minval=2, group=grp_r)
+
+grp_s      = "Session (optional)"
+use_sess   = input.bool(false, "Only trade inside a session, flat outside", group=grp_s)
+sess       = input.session("1000-2100", "Session", group=grp_s)
+tz         = input.string("GMT+2", "Timezone", group=grp_s)
+
+// ---------------------------
+// 2. Levels, filters, DF gauge
+// ---------------------------
+atr_val  = ta.atr(atr_len)
+ema_val  = ta.ema(close, ema_len)
+range_hi = ta.highest(high, bo_len)[1]
+range_lo = ta.lowest(low, bo_len)[1]
+fresh_up = close > range_hi and close[1] <= range_hi[1]
+fresh_dn = close < range_lo and close[1] >= range_lo[1]
+up_ok    = not use_trend or close > ema_val
+dn_ok    = not use_trend or close < ema_val
+in_sess  = not use_sess or not na(time(timeframe.period, sess, tz))
+trail_lo = ta.lowest(low, trail_len)[1]
+trail_hi = ta.highest(high, trail_len)[1]
+rev_hi   = ta.highest(high, rev_sbars)
+rev_lo   = ta.lowest(low, rev_sbars)
+
+y     = close
+dy    = y - nz(y[1])
+y_lag = nz(y[1])
+mean_dy   = ta.sma(dy, df_len)
+mean_ylag = ta.sma(y_lag, df_len)
+covar     = ta.sma(dy * y_lag, df_len) - (mean_dy * mean_ylag)
+var_y     = ta.sma(y_lag * y_lag, df_len) - (mean_ylag * mean_ylag)
+beta_coef  = var_y == 0 ? 0 : covar / var_y
+alpha_coef = mean_dy - (beta_coef * mean_ylag)
+res        = dy - (alpha_coef + (beta_coef * y_lag))
+mse        = ta.sma(res * res, df_len)
+se_beta    = (df_len * var_y) <= 0 ? 0.0001 : math.sqrt(mse / (df_len * var_y))
+t_stat     = beta_coef / se_beta
+
+f_pct_rank(float val, int len) =>
+    int count_below = 0
+    for i = 0 to len - 1
+        if val > val[i]
+            count_below += 1
+    (count_below / len) * 100.0
+
+t_pct    = f_pct_rank(t_stat, norm_len)
+t_delta  = t_stat - nz(t_stat[1])
+df_hook  = (t_stat > 0) and (t_pct >= pct_cut) and (t_delta < -df_tol)
+use_skip = df_mode == "Skip entries after a hook" or df_mode == "Both"
+use_exit = df_mode == "Exit on a hook" or df_mode == "Both"
+skip_now = use_skip and nz(ta.barssince(df_hook), 9999) <= hook_lb
+
+// ---------------------------
+// 3. Retest state
+// ---------------------------
+var float lvl_up = na
+var int   bar_up = na
+var float lvl_dn = na
+var int   bar_dn = na
+
+retest_long  = not na(lvl_up) and bar_index > bar_up and low  <= lvl_up + retest_tol * atr_val and close > lvl_up
+retest_short = not na(lvl_dn) and bar_index > bar_dn and high >= lvl_dn - retest_tol * atr_val and close < lvl_dn
+failed_up    = not na(lvl_up) and close < lvl_up - retest_tol * atr_val
+failed_dn    = not na(lvl_dn) and close > lvl_dn + retest_tol * atr_val
+expired_up   = not na(lvl_up) and bar_index - bar_up > retest_win
+expired_dn   = not na(lvl_dn) and bar_index - bar_dn > retest_win
+
+// ---------------------------
+// 4. Position state
+// ---------------------------
+pos_size = strategy.position_size
+eid      = strategy.position_entry_name
+in_v12   = pos_size != 0 and (eid == "L" or eid == "S")
+in_rev   = pos_size != 0 and (eid == "RL" or eid == "RS")
+
+var float stop_px   = na
+var float tgt_px    = na
+var float init_risk = na
+var bool  locked    = false
+var float r_stop    = na
+var float r_tgt     = na
+var int   rev_bar   = na
+
+// ---------------------------
+// 5. DF hook: close the trend trade, or reverse it
+// ---------------------------
+f_open_rev(int dir) =>
+    raw  = dir == 1 ? rev_lo - rev_buf * atr_val : rev_hi + rev_buf * atr_val
+    risk = math.max(math.abs(close - raw), 0.5 * atr_val)
+    st   = dir == 1 ? close - risk : close + risk
+    ema_ok = dir == 1 ? ema_val > close : ema_val < close
+    tg   = rev_tmode == "Trend EMA" and ema_ok ? ema_val : (dir == 1 ? close + rev_rr * risk : close - rev_rr * risk)
+    [st, tg]
+
+did_rev = false
+rev_dir = 0
+if df_hook and in_sess
+    if in_v12 and use_exit
+        if rev_mode != "Off"
+            rev_dir := pos_size > 0 ? -1 : 1
+        else
+            strategy.close_all(comment="DF hook")
+    else if pos_size == 0 and rev_mode == "On every hook"
+        rev_dir := close > close[bo_len] ? -1 : 1
+
+if rev_dir != 0
+    [st, tg] = f_open_rev(rev_dir)
+    r_stop  := st
+    r_tgt   := tg
+    rev_bar := bar_index
+    did_rev := true
+    // entering the opposite way also closes the trend trade on the same fill
+    strategy.entry(rev_dir == 1 ? "RL" : "RS", rev_dir == 1 ? strategy.long : strategy.short, comment=rev_dir == 1 ? "Rev L" : "Rev S")
+
+// ---------------------------
+// 6. Trend entries
+// ---------------------------
+long_sig  = entry_mode == "Break" ? (fresh_up and up_ok) : retest_long
+short_sig = entry_mode == "Break" ? (fresh_dn and dn_ok) : retest_short
+flat      = pos_size == 0 and not did_rev
+go_long   = flat and in_sess and long_sig and not skip_now
+go_short  = flat and in_sess and short_sig and not go_long and not skip_now
+
+if go_long or go_short
+    init_risk := sl_atr * atr_val
+    stop_px   := go_long ? close - init_risk : close + init_risk
+    tgt_px    := go_long ? close + rr * init_risk : close - rr * init_risk
+    locked    := false
+    strategy.entry(go_long ? "L" : "S", go_long ? strategy.long : strategy.short, comment=go_long ? "Trend L" : "Trend S")
+
+if go_long or failed_up or expired_up
+    lvl_up := na
+if go_short or failed_dn or expired_dn
+    lvl_dn := na
+if fresh_up and up_ok
+    lvl_up := range_hi
+    bar_up := bar_index
+    lvl_dn := na
+if fresh_dn and dn_ok
+    lvl_dn := range_lo
+    bar_dn := bar_index
+    lvl_up := na
+
+// ---------------------------
+// 7. Stops and targets
+// ---------------------------
+if in_v12 and not did_rev
+    if exit_mode == "Trailing channel"
+        stop_px := pos_size > 0 ? math.max(stop_px, trail_lo) : math.min(stop_px, trail_hi)
+    if exit_mode == "One-step lock" and not locked
+        ep = strategy.position_avg_price
+        if pos_size > 0 and high - ep >= lock_trg * init_risk
+            stop_px := math.max(stop_px, ep + lock_at * init_risk)
+            locked  := true
+        if pos_size < 0 and ep - low >= lock_trg * init_risk
+            stop_px := math.min(stop_px, ep - lock_at * init_risk)
+            locked  := true
+
+// reversal target follows the EMA while it's on the right side of price
+if in_rev and rev_tmode == "Trend EMA" and (pos_size > 0 ? ema_val > close : ema_val < close)
+    r_tgt := ema_val
+
+has_tp = exit_mode == "Fixed R"
+strategy.exit("LX", "L", stop=stop_px, limit=has_tp ? tgt_px : na, comment="Trend exit")
+strategy.exit("SX", "S", stop=stop_px, limit=has_tp ? tgt_px : na, comment="Trend exit")
+strategy.exit("RLX", "RL", stop=r_stop, limit=r_tgt, comment="Rev exit")
+strategy.exit("RSX", "RS", stop=r_stop, limit=r_tgt, comment="Rev exit")
+
+if in_rev and bar_index - rev_bar >= rev_max
+    strategy.close_all(comment="Rev time")
+if use_sess and pos_size != 0 and not in_sess
+    strategy.close_all(comment="Session end")
+
+// ---------------------------
+// 8. Results split: trend vs reversal
+// ---------------------------
+var table tb = table.new(position.top_right, 5, 4, bgcolor=color.new(color.black, 20), border_width=1)
+if barstate.islast
+    float t_gp = 0.0
+    float t_gl = 0.0
+    float r_gp = 0.0
+    float r_gl = 0.0
+    int t_n = 0
+    int r_n = 0
+    int t_w = 0
+    int r_w = 0
+    n = strategy.closedtrades
+    if n > 0
+        for i = 0 to n - 1
+            id = strategy.closedtrades.entry_id(i)
+            p  = strategy.closedtrades.profit(i)
+            if id == "RL" or id == "RS"
+                r_n += 1
+                r_w += p > 0 ? 1 : 0
+                r_gp += p > 0 ? p : 0.0
+                r_gl += p < 0 ? -p : 0.0
+            else
+                t_n += 1
+                t_w += p > 0 ? 1 : 0
+                t_gp += p > 0 ? p : 0.0
+                t_gl += p < 0 ? -p : 0.0
+    table.cell(tb, 0, 0, "Trail " + str.tostring(trail_len) + " bars", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 0, "Trades", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 2, 0, "Win %", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 3, 0, "PF", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 4, 0, "Net", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 0, 1, "Trend", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 1, str.tostring(t_n), text_color=color.white, text_size=size.small)
+    table.cell(tb, 2, 1, t_n > 0 ? str.tostring(100.0 * t_w / t_n, "#.#") : "-", text_color=color.white, text_size=size.small)
+    table.cell(tb, 3, 1, t_gl > 0 ? str.tostring(t_gp / t_gl, "#.##") : "-", text_color=color.white, text_size=size.small)
+    table.cell(tb, 4, 1, str.tostring(t_gp - t_gl, "#.##"), text_color=t_gp >= t_gl ? color.lime : color.red, text_size=size.small)
+    table.cell(tb, 0, 2, "Reversal", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 2, str.tostring(r_n), text_color=color.white, text_size=size.small)
+    table.cell(tb, 2, 2, r_n > 0 ? str.tostring(100.0 * r_w / r_n, "#.#") : "-", text_color=color.white, text_size=size.small)
+    table.cell(tb, 3, 2, r_gl > 0 ? str.tostring(r_gp / r_gl, "#.##") : "-", text_color=color.white, text_size=size.small)
+    table.cell(tb, 4, 2, str.tostring(r_gp - r_gl, "#.##"), text_color=r_gp >= r_gl ? color.lime : color.red, text_size=size.small)
+    table.cell(tb, 0, 3, "Max DD", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 1, 3, str.tostring(strategy.max_drawdown, "#.##"), text_color=color.gray, text_size=size.small)
+
+// ---------------------------
+// 9. Visuals
+// ---------------------------
+plot(use_trend or rev_tmode == "Trend EMA" ? ema_val : na, "Trend EMA", color=color.new(color.gray, 55))
+plot(in_v12 ? stop_px : na, "Trend stop", color=color.new(color.orange, 30), style=plot.style_linebr)
+plot(in_rev ? r_stop : na, "Rev stop", color=color.new(color.red, 30), style=plot.style_linebr)
+plot(in_rev ? r_tgt : na, "Rev target", color=color.new(color.aqua, 30), style=plot.style_linebr)
+plotshape(df_hook, title="DF hook", style=shape.circle, location=location.bottom, color=color.new(color.aqua, 20), size=size.tiny)
